@@ -1,542 +1,316 @@
-# main.py - Claude Code Assistant with recursive code execution
-from logger import get_logger
-logger = get_logger("app")
+# pip install anthropic
+# pip install colorama
+# pip install pyyaml
+# pip install requests
+# pip install pillow
 
 import os
 import re
 from pathlib import Path
-import anthropic
-from prompt_toolkit import prompt
-from prompt_toolkit.history import InMemoryHistory
-from utils import clean_html
-from runner import execute_python_code
-import shutil
-import textwrap
+from colorama import Fore, Style, init
+from src.runner import execute_python_code
+from src.logger import get_logger
 
 
-# ANSI Color Theme
-class Colors:
-    USER = "\033[38;2;100;181;246m"      # Light blue
-    CLAUDE = "\033[38;2;129;199;132m"    # Light green
-    SYSTEM = "\033[38;2;255;183;77m"     # Amber
-    CODE = "\033[38;2;206;147;216m"      # Purple
-    OUTPUT = "\033[38;2;77;208;225m"     # Cyan
-    ERROR = "\033[38;2;239;83;80m"       # Red
-    SEPARATOR = "\033[38;2;66;66;66m"    # Dark gray
-    PROMPT = "\033[38;2;156;39;176m"     # Purple
-    STATUS = "\033[38;2;158;158;158m"    # Gray
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-
-def get_terminal_width():
-    """Get terminal width for word wrapping."""
-    return shutil.get_terminal_size().columns
-
-
-def wrap_text(text, width=None, indent=0):
-    """Wrap text to terminal width."""
-    if width is None:
-        width = get_terminal_width()
-    
-    width = max(width - indent, 40)
-    
-    lines = []
-    for paragraph in text.split('\n'):
-        if paragraph.strip():
-            wrapped = textwrap.fill(
-                paragraph,
-                width=width,
-                break_long_words=False,
-                break_on_hyphens=False
-            )
-            lines.append(' ' * indent + wrapped)
-        else:
-            lines.append('')
-    
-    return '\n'.join(lines)
-
-
-def load_prompt():
-    """Load system prompt from file."""
-    logger.info("Loading system prompt from assets/prompt.txt")
-    prompt_path = Path("assets/prompt.txt")
-    if prompt_path.exists():
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            logger.info(f"System prompt loaded: {len(content)} characters")
-            logger.debug("System prompt content:\n" + content[:500] + "...")
-            return content
-    logger.warning("System prompt file not found, using empty prompt")
-    return ""
-
-
-def extract_cmd(text):
-    """Extract command status from response."""
-    logger.debug("Extracting CMD status from response")
-    if "```cmd" in text:
-        start = text.find("```cmd") + 6
-        end = text.find("```", start)
-        if end != -1:
-            cmd = text[start:end].strip()
-            logger.info(f"CMD status extracted: '{cmd}'")
-            return cmd
-        else:
-            logger.warning("CMD block found but no closing ```")
-    else:
-        logger.warning("No ```cmd block found in response, defaulting to DONE")
-    return "DONE"
-
-
-def extract_python_code(text):
-    """Extract Python code from response."""
-    logger.debug("Extracting Python code from response")
-    lines = text.split("\n")
-    in_python_block = False
-    code_lines = []
-    
-    for i, line in enumerate(lines):
-        if line.strip().startswith("```python"):
-            logger.debug(f"Found Python code block start at line {i}")
-            in_python_block = True
-            continue
-        elif line.strip().startswith("```") and in_python_block:
-            logger.debug(f"Found Python code block end at line {i}")
-            break
-        elif in_python_block:
-            code_lines.append(line)
-    
-    code = "\n".join(code_lines)
-    if code:
-        logger.info(f"Extracted Python code: {len(code)} characters, {len(code_lines)} lines")
-        logger.debug(f"First 200 chars of code:\n{code[:200]}")
-    else:
-        logger.info("No Python code found in response")
-    
-    return code
-
-
-def remove_code_blocks(text):
-    """Remove code blocks from text for display."""
-    logger.debug("Removing code blocks from text for display")
-    original_len = len(text)
-    
-    text = re.sub(r'```txt\n(.*?)\n```', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'```python.*?```', '', text, flags=re.DOTALL)
-    text = re.sub(r'```cmd.*?```', '', text, flags=re.DOTALL)
-    
-    cleaned = text.strip()
-    logger.debug(f"Text cleaned: {original_len} -> {len(cleaned)} characters")
-    
-    return cleaned
-
-
-def print_separator(char='='):
-    """Print a visual separator."""
-    width = get_terminal_width()
-    print(f"{Colors.SEPARATOR}{char * width}{Colors.RESET}")
-
-
-def print_message(role, content, show_code=True):
-    """Print a formatted message with colors and word wrapping."""
-    logger.debug(f"Printing message: role={role}, length={len(content)}, show_code={show_code}")
-    
-    print_separator()
-    
-    if role == "user":
-        print(f"{Colors.BOLD}{Colors.USER}YOU:{Colors.RESET}")
-        color = Colors.USER
-    elif role == "claude":
-        print(f"{Colors.BOLD}{Colors.CLAUDE}CLAUDE:{Colors.RESET}")
-        color = Colors.CLAUDE
-    else:
-        print(f"{Colors.BOLD}{Colors.SYSTEM}SYSTEM:{Colors.RESET}")
-        color = Colors.ERROR
-    
-    print()
-    
-    # Print main content without code blocks
-    cleaned_content = remove_code_blocks(content)
-    wrapped_content = wrap_text(cleaned_content)
-    print(f"{color}{wrapped_content}{Colors.RESET}")
-    
-    # Show code blocks separately if requested
-    if show_code and role == "claude":
-        code = extract_python_code(content)
-        if code:
-            logger.debug("Displaying code block in output")
-            print(f"\n{Colors.CODE}{Colors.BOLD}--- CODE ---{Colors.RESET}")
-            wrapped_code = wrap_text(code, indent=0)
-            print(f"{Colors.CODE}{wrapped_code}{Colors.RESET}")
-        else:
-            logger.debug("No code to display")
-
-
-def get_format_reminder():
-    """Get format reminder to append to user messages."""
-    return """
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️  MANDATORY FORMAT - VIOLATION WILL BE REJECTED ⚠️
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-EVERY SINGLE RESPONSE MUST FOLLOW THIS FORMAT:
-
-1. Start with ```txt block containing explanation/analysis
-2. Then ```python block with executable code (if needed)
-3. End with ```cmd block containing either "AWAIT" or "DONE"
-
-❌ NEVER write text outside code blocks
-❌ NEVER skip the ```cmd block
-❌ NEVER break this format for ANY reason
-
-Example:
-```txt
-Explanation here
-```
-```python
-# code here
-```
-```cmd
-AWAIT
-```
-
-THIS APPLIES TO ALL RESPONSES INCLUDING FOLLOW-UPS!
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-
-
-def log_history_metadata(history, context=""):
-    """Log detailed metadata about conversation history."""
-    logger.info(f"=== HISTORY METADATA {context} ===")
-    logger.info(f"Total messages: {len(history)}")
-    
-    for i, msg in enumerate(history):
-        role = msg.get('role', 'unknown')
-        content = msg.get('content', '')
-        content_len = len(content)
-        
-        # Count code blocks
-        python_blocks = content.count('```python')
-        cmd_blocks = content.count('```cmd')
-        txt_blocks = content.count('```txt')
-        
-        logger.info(f"  [{i}] {role}: {content_len} chars | "
-                   f"python={python_blocks} cmd={cmd_blocks} txt={txt_blocks}")
-        
-        # Log first 150 chars
-        preview = content[:150].replace('\n', '\\n')
-        logger.debug(f"       Preview: {preview}...")
-    
-    logger.info("=== END HISTORY METADATA ===")
-
-
-def call_claude(client, system_prompt, task, conversation_history):
-    """Call Claude API with conversation history."""
-    logger.info("=" * 80)
-    logger.info("CALL_CLAUDE INVOKED")
-    logger.info("=" * 80)
-    
-    try:
-        # Add format reminder to user messages
-        task_with_reminder = task + get_format_reminder()
-        
-        logger.info(f"Task lengths - Original: {len(task)} chars, With reminder: {len(task_with_reminder)} chars")
-        logger.debug("=" * 80)
-        logger.debug("RAW INPUT TO CLAUDE (with format reminder):")
-        logger.debug(task_with_reminder)
-        logger.debug("=" * 80)
-        
-        # Build messages array with history
-        messages = conversation_history + [{"role": "user", "content": task_with_reminder}]
-        
-        logger.info(f"Building message array: {len(conversation_history)} history + 1 new = {len(messages)} total")
-        
-        # Log full history metadata
-        log_history_metadata(messages, "BEFORE API CALL")
-        
-        logger.debug("=" * 80)
-        logger.debug("COMPLETE MESSAGES ARRAY BEING SENT TO API:")
-        for i, msg in enumerate(messages):
-            logger.debug(f"\n--- Message [{i}] Role: {msg['role']} | Length: {len(msg['content'])} chars ---")
-            logger.debug(msg['content'])
-            logger.debug("--- End Message ---")
-        logger.debug("=" * 80)
-        
-        # Call API
-        logger.info("Calling Anthropic API...")
-        logger.info(f"Model: claude-sonnet-4-20250514, max_tokens: 8192")
-        logger.info(f"System prompt length: {len(system_prompt)} chars")
-        
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=8192,
-            system=system_prompt,
-            messages=messages
-        )
-        
-        logger.info("API call successful")
-        logger.debug(f"Response object type: {type(message)}")
-        logger.debug(f"Response attributes: {dir(message)}")
-        
-        # Log API response metadata
-        if hasattr(message, 'usage'):
-            logger.info(f"Token usage: {message.usage}")
-        if hasattr(message, 'stop_reason'):
-            logger.info(f"Stop reason: {message.stop_reason}")
-        
-        response_text = message.content[0].text
-        logger.info(f"Response text extracted: {len(response_text)} characters")
-        
-        logger.debug("=" * 80)
-        logger.debug("RAW RESPONSE FROM CLAUDE (COMPLETE):")
-        logger.debug(response_text)
-        logger.debug("=" * 80)
-        
-        # Extract and log CMD status
-        cmd_status = extract_cmd(response_text)
-        logger.info(f"CMD status: '{cmd_status}'")
-        
-        # Check for code blocks
-        has_python = '```python' in response_text
-        has_cmd = '```cmd' in response_text
-        has_txt = '```txt' in response_text
-        logger.info(f"Code blocks present - python: {has_python}, cmd: {has_cmd}, txt: {has_txt}")
-        
-        if not has_cmd:
-            logger.warning("⚠️  MISSING CMD BLOCK IN RESPONSE!")
-        
-        return response_text, cmd_status
-        
-    except Exception as e:
-        logger.error("=" * 80)
-        logger.error("EXCEPTION IN CALL_CLAUDE")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}")
-        logger.error("=" * 80, exc_info=True)
-        return None, str(e)
-
-
-def execute_and_process_code(client, system_prompt, conversation_history, code, depth=0):
-    """
-    Execute code and process results recursively.
-    
-    Args:
-        client: Anthropic client
-        system_prompt: System prompt for Claude
-        conversation_history: Current conversation history
-        code: Python code to execute
-        depth: Recursion depth (for logging)
-    
-    Returns:
-        Updated conversation history
-    """
-    indent = "  " * depth
-    logger.info(f"{indent}={'=' * 80}")
-    logger.info(f"{indent}CODE EXECUTION STARTING (depth={depth})")
-    logger.info(f"{indent}={'=' * 80}")
-    logger.debug(f"{indent}Code to execute:\n{code}")
-    
-    print(f"\n{Colors.STATUS}[Executing code...]{Colors.RESET}")
-    
-    try:
-        result = execute_python_code(code)
-        logger.info(f"{indent}Code execution completed")
-        logger.debug(f"{indent}{'=' * 80}")
-        logger.debug(f"{indent}EXECUTION RESULT:")
-        logger.debug(result)
-        logger.debug(f"{indent}{'=' * 80}")
-        
-        print(f"\n{Colors.OUTPUT}{Colors.BOLD}--- OUTPUT ---{Colors.RESET}")
-        wrapped_output = wrap_text(result)
-        print(f"{Colors.OUTPUT}{wrapped_output}{Colors.RESET}")
-        
-        # Send results back to Claude
-        print(f"\n{Colors.STATUS}[Processing results...]{Colors.RESET}")
-        
-        result_message = f"Code execution results:\n{result}"
-        conversation_history.append({"role": "user", "content": result_message})
-        
-        logger.info(f"{indent}Sending execution results back to Claude ({len(result_message)} chars)")
-        logger.debug(f"{indent}{'=' * 80}")
-        logger.debug(f"{indent}CODE EXECUTION RESULTS MESSAGE:")
-        logger.debug(result_message)
-        logger.debug(f"{indent}{'=' * 80}")
-        log_history_metadata(conversation_history, f"AFTER EXECUTION RESULTS (depth={depth})")
-        
-        # Get Claude's response to execution results
-        response, cmd_status = call_claude(
-            client, 
-            system_prompt, 
-            result_message,
-            conversation_history[:-1]
-        )
-        
-        if response:
-            conversation_history.append({"role": "assistant", "content": response})
-            logger.info(f"{indent}Added response to execution results. Total: {len(conversation_history)}")
-            log_history_metadata(conversation_history, f"AFTER RESPONSE TO RESULTS (depth={depth})")
-            
-            # Always show code
-            print_message("claude", response, show_code=True)
-            
-            # Check if this response also contains code to execute (recursive)
-            followup_code = extract_python_code(response)
-            if followup_code:
-                logger.info(f"{indent}Response contains code - executing recursively (depth={depth+1})")
-                conversation_history = execute_and_process_code(
-                    client, 
-                    system_prompt, 
-                    conversation_history, 
-                    followup_code, 
-                    depth + 1
-                )
-            else:
-                logger.info(f"{indent}Response contains no code - execution chain complete")
-        else:
-            logger.warning(f"{indent}Failed to get response for code results")
-            conversation_history.pop()
-            logger.info(f"{indent}Removed failed results message. Total: {len(conversation_history)}")
-            
-    except Exception as e:
-        logger.error(f"{indent}{'=' * 80}")
-        logger.error(f"{indent}CODE EXECUTION ERROR (depth={depth})")
-        logger.error(f"{indent}Error type: {type(e).__name__}")
-        logger.error(f"{indent}Error: {e}")
-        logger.error(f"{indent}{'=' * 80}", exc_info=True)
-        print(f"\n{Colors.ERROR}ERROR executing code: {e}{Colors.RESET}")
-    
-    return conversation_history
-
+from src.utils import *
+init(autoreset=False)
+logger = get_logger(__name__)
 
 def main():
-    """Main CLI loop."""
-    logger.info("=" * 80)
-    logger.info("CLAUDE CODE ASSISTANT STARTING")
-    logger.info("=" * 80)
-    
-    # Check if terminal supports colors
+    import anthropic
+    import requests
+    import json
+    from PIL import Image
+    import io
     import sys
-    if not sys.stdout.isatty():
-        logger.warning("Terminal doesn't support TTY, disabling colors")
-        for attr in dir(Colors):
-            if not attr.startswith('_'):
-                setattr(Colors, attr, '')
+    import tty
+    import termios
+    import subprocess
     
-    # Header
-    print_separator('=')
-    print(f"{Colors.BOLD}{Colors.CLAUDE}CLAUDE CODE ASSISTANT{Colors.RESET} {Colors.DIM}CLI Version{Colors.RESET}")
-    print_separator('=')
-    print(f"\n{Colors.STATUS}Use {Colors.BOLD}Ctrl+D{Colors.RESET}{Colors.STATUS} or type {Colors.BOLD}'quit'{Colors.RESET}{Colors.STATUS} to exit.")
-    print(f"Press {Colors.BOLD}Alt+Enter{Colors.RESET}{Colors.STATUS} or {Colors.BOLD}Esc Enter{Colors.RESET}{Colors.STATUS} to send message.{Colors.RESET}\n")
+    logger.info("Starting main application")
     
-    # Load system prompt and API key
-    system_prompt = load_prompt()
-    api_key = os.environ.get("basht")
+    KEY_MATHPIX_ID = os.getenv('KEY_MATHPIX')
+    KEY_MATHPIX_KEY = os.getenv('KEY_MATHPIX')
+    KEY_CLAUDE = os.getenv('KEY_CLAUDE')
+    USE_1M_CONTEXT = os.getenv('USE_1M_CONTEXT', 'false').lower() == 'true'
     
-    if not api_key:
-        logger.error("API key not found in environment variable 'basht'")
-        print(f"{Colors.ERROR}ERROR: API key not found in environment variable 'basht'{Colors.RESET}")
+    if not KEY_CLAUDE:
+        print(f"{Fore.RED}Error: KEY_CLAUDE environment variable not set{Style.RESET_ALL}")
         return
+    if not KEY_MATHPIX_ID:
+        print(f"{Fore.YELLOW}Warning: KEY_MATHPIX not set - image processing disabled{Style.RESET_ALL}")
     
-    logger.info("API key loaded successfully (length: {} chars)".format(len(api_key)))
-    client = anthropic.Anthropic(api_key=api_key)
-    logger.info("Anthropic client initialized")
+    def get_clipboard_image():
+        try:
+            types = subprocess.run(['wl-paste', '--list-types'], 
+                                  capture_output=True, text=True, timeout=1).stdout
+            if 'image/' not in types:
+                return None
+            data = subprocess.run(['wl-paste', '--type', 'image/png'], 
+                                 capture_output=True, timeout=2).stdout
+            return Image.open(io.BytesIO(data)) if data else None
+        except:
+            return None
     
-    # Conversation history
-    conversation_history = []
-    
-    # Setup prompt_toolkit with history
-    history = InMemoryHistory()
-    logger.info("Prompt toolkit history initialized")
-    
-    message_count = 0
-    
-    while True:
-        logger.info("-" * 80)
-        logger.info(f"LOOP ITERATION - Waiting for user input (message #{message_count + 1})")
-        logger.info("-" * 80)
+    def rich_input(prompt=""):
+        def paste(b, c): 
+            img = get_clipboard_image()
+            if img:
+                for ch in f"[IMAGE:{img.size[0]}x{img.size[1]}]": 
+                    b.insert(c, ch)
+                    c += 1
+            else:
+                try:
+                    for ch in subprocess.run(['wl-paste'], capture_output=True, text=True, timeout=1).stdout: 
+                        b.insert(c, ch)
+                        c += 1
+                except: 
+                    pass
+            return b, c
         
-        # Get user input
-        print_separator()
-        print(f"{Colors.BOLD}{Colors.USER}YOU:{Colors.RESET}")
+        cb = {
+            'ctrl_c': lambda b,c: (b,c,True),
+            'ctrl_v': lambda b,c: (*paste(b,c),False),
+            'enter': lambda b,c: (b[:c]+['\n']+b[c:],c+1,False),
+            'backspace': lambda b,c: (b[:c-1]+b[c:],c-1,False) if c>0 else (b,c,False),
+            'left': lambda b,c: (b,max(0,c-1),False),
+            'right': lambda b,c: (b,min(len(b),c+1),False),
+            'esc_enter': lambda b,c: (b,c,True),
+            'char': lambda b,c,ch: (b[:c]+[ch]+b[c:],c+1,False),
+        }
+        
+        print(prompt, end='', flush=True)
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            buf, cur = [], 0
+            while True:
+                ch = sys.stdin.read(1)
+                redraw = True
+                if ch == '\x03': 
+                    raise KeyboardInterrupt
+                elif ch == '\x16': 
+                    buf,cur,exit = cb['ctrl_v'](buf,cur)
+                elif ch in ('\r','\n'): 
+                    buf,cur,exit = cb['enter'](buf,cur)
+                    redraw=False
+                    print('\r\n',end='',flush=True)
+                elif ch in ('\x7f','\x08'): 
+                    buf,cur,exit = cb['backspace'](buf,cur)
+                elif ch == '\x1b':
+                    n = sys.stdin.read(1)
+                    if n in ('\r','\n'): 
+                        print('\r\n')
+                        return ''.join(buf)
+                    elif n == '[':
+                        n2 = sys.stdin.read(1)
+                        if n2 == 'D': 
+                            buf,cur,exit = cb['left'](buf,cur)
+                        elif n2 == 'C': 
+                            buf,cur,exit = cb['right'](buf,cur)
+                elif ch.isprintable() or ch == ' ': 
+                    buf,cur,exit = cb['char'](buf,cur,ch)
+                else: 
+                    redraw = False
+                if redraw:
+                    s=cur
+                    while s>0 and buf[s-1]!='\n': s-=1
+                    e=cur
+                    while e<len(buf) and buf[e]!='\n': e+=1
+                    sys.stdout.write('\r\033[K'+''.join(buf[s:e])+'\r'+(f'\033[{cur-s}C' if cur>s else ''))
+                    sys.stdout.flush()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    
+    def process_mathpix_image(img):
+        if not KEY_MATHPIX_ID:
+            return "[Mathpix not configured]"
+        
+        temp_path = Path("temp_clipboard_image.png")
+        img.save(temp_path)
         
         try:
-            user_input = prompt(
-                "> ",
-                multiline=True,
-                history=history,
-                enable_history_search=True,
-                mouse_support=True,
-            ).strip()
-            logger.info(f"User input received: {len(user_input)} characters")
+            headers = {
+                "app_id": KEY_MATHPIX_ID,
+                "app_key": KEY_MATHPIX_KEY
+            }
             
-        except (EOFError, KeyboardInterrupt):
-            logger.info("User initiated exit (EOF/KeyboardInterrupt)")
-            print(f"\n{Colors.STATUS}Goodbye!{Colors.RESET}")
-            break
-        
-        if not user_input:
-            logger.debug("Empty input, continuing")
-            continue
-        
-        if user_input.lower() in ['quit', 'exit', 'q']:
-            logger.info("User quit command received")
-            print(f"\n{Colors.STATUS}Goodbye!{Colors.RESET}")
-            break
-        
-        message_count += 1
-        logger.info(f"Processing message #{message_count}")
-        logger.debug("=" * 80)
-        logger.debug(f"RAW USER INPUT #{message_count}:")
-        logger.debug(user_input)
-        logger.debug("=" * 80)
-        
-        # Add to conversation history
-        conversation_history.append({"role": "user", "content": user_input})
-        logger.info(f"Added to history. Total messages: {len(conversation_history)}")
-        log_history_metadata(conversation_history, "AFTER USER INPUT")
-        
-        # Clean input
-        cleaned_input = clean_html(user_input)
-        if cleaned_input != user_input:
-            logger.info(f"Input cleaned: {len(user_input)} -> {len(cleaned_input)} chars")
-        
-        # Call Claude
-        print(f"\n{Colors.STATUS}[Calling Claude...]{Colors.RESET}")
-        response, cmd_status = call_claude(client, system_prompt, cleaned_input, conversation_history[:-1])
-        
-        if response is None:
-            logger.error(f"Failed to get response. Error: {cmd_status}")
-            print(f"\n{Colors.ERROR}ERROR: {cmd_status}{Colors.RESET}")
-            conversation_history.pop()
-            logger.info(f"Removed failed message from history. Total: {len(conversation_history)}")
-            continue
-        
-        # Add response to history
-        conversation_history.append({"role": "assistant", "content": response})
-        logger.info(f"Added response to history. Total messages: {len(conversation_history)}")
-        log_history_metadata(conversation_history, "AFTER CLAUDE RESPONSE")
-        
-        # Print Claude's response (always show code)
-        print_message("claude", response, show_code=True)
-        
-        # Extract and execute code if present (with recursive handling)
-        code = extract_python_code(response)
-        if code:
-            conversation_history = execute_and_process_code(
-                client, 
-                system_prompt, 
-                conversation_history, 
-                code, 
-                depth=0
-            )
+            with open(temp_path, 'rb') as f:
+                files = {'file': f}
+                options = {'formats': ['text']}
+                form_data = {'options_json': json.dumps(options)}
+                
+                response = requests.post(
+                    "https://api.mathpix.com/v3/text",
+                    headers=headers,
+                    files=files,
+                    data=form_data
+                )
+            
+            response.raise_for_status()
+            result = response.json()
+            extracted_text = result.get('text', '[Failed to extract text]')
+            
+            temp_path.unlink()
+            return extracted_text
+            
+        except Exception as e:
+            logger.error(f"Mathpix API error: {str(e)}")
+            if temp_path.exists():
+                temp_path.unlink()
+            return f"[Image processing error: {str(e)}]"
     
-    logger.info("=" * 80)
-    logger.info(f"APPLICATION CLOSING - Total messages processed: {message_count}")
-    logger.info("=" * 80)
-
+    def process_user_input(user_input):
+        image_pattern = r'\[IMAGE:(\d+)x(\d+)\]'
+        matches = list(re.finditer(image_pattern, user_input))
+        
+        if not matches:
+            return user_input
+        
+        logger.info(f"Found {len(matches)} image markers")
+        processed_input = user_input
+        offset = 0
+        
+        for match in matches:
+            print(f"{Fore.YELLOW}Processing image from clipboard...{Style.RESET_ALL}")
+            
+            img = get_clipboard_image()
+            if img:
+                print(f"{Fore.YELLOW}Sending to Mathpix...{Style.RESET_ALL}")
+                extracted_text = process_mathpix_image(img)
+                
+                print(f"{Fore.GREEN}Image processed{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Extracted:{Style.RESET_ALL}")
+                print_colored(extracted_text[:200] + "..." if len(extracted_text) > 200 else extracted_text, Fore.LIGHTBLUE_EX)
+                
+                replacement = f"\n[IMAGE CONTENT]:\n{extracted_text}\n[END IMAGE]\n"
+            else:
+                replacement = "[No image in clipboard]"
+            
+            start = match.start() + offset
+            end = match.end() + offset
+            processed_input = processed_input[:start] + replacement + processed_input[end:]
+            offset += len(replacement) - (end - start)
+        
+        return processed_input
+    
+    prompt_text = read_file("src/assets/prompt.txt")
+    context_text = read_file("context.txt")
+    
+    if not prompt_text:
+        print(f"{Fore.RED}Error: prompt.txt not found{Style.RESET_ALL}")
+        return
+    
+    client = anthropic.Anthropic(api_key=KEY_CLAUDE)
+    conversation = []
+    logger.info("Chat initialized")
+    
+    context_mode = "1M tokens" if USE_1M_CONTEXT else "200K tokens"
+    print(f"{Fore.CYAN}{'='*60}")
+    print(f"{Fore.CYAN}AI Code Assistant Started ({context_mode})")
+    print(f"{Fore.CYAN}Press Ctrl+V to paste images, Esc+Enter to submit")
+    print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+    
+    task_input = rich_input(f"{Fore.GREEN}Enter your task: {Style.RESET_ALL}")
+    task = process_user_input(task_input)
+    logger.info(f"User task: {task[:100]}...")
+    
+    first_message = f"{prompt_text}\n\nCONTEXT:\n{context_text}\n\nTASK:\n{task}"
+    
+    while True:
+        print(f"\n{Fore.YELLOW}Sending request to AI...{Style.RESET_ALL}\n")
+        logger.info("Sending request to AI")
+        
+        conversation.append({
+            "role": "user",
+            "content": first_message if 'first_message' in locals() else task
+        })
+        
+        if 'first_message' in locals():
+            del first_message
+        
+        stream_kwargs = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 32000,
+            "messages": conversation
+        }
+        
+        if USE_1M_CONTEXT:
+            stream_kwargs["betas"] = ["context-1m-2025-08-07"]
+            logger.info("Using 1M token context window")
+        
+        with client.messages.stream(**stream_kwargs) as stream:
+            response_text = ""
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+                response_text += text
+        
+        print()
+        conversation.append({
+            "role": "assistant",
+            "content": response_text
+        })
+        
+        logger.info(f"Received response (length: {len(response_text)})")
+        
+        code_blocks = extract_code_blocks(response_text)
+        
+        if code_blocks:
+            for idx, code in enumerate(code_blocks, 1):
+                print(f"\n{Fore.CYAN}{'='*60}")
+                print(f"{Fore.CYAN}EXECUTING CODE BLOCK {idx}/{len(code_blocks)}")
+                print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
+                
+                logger.info(f"Executing code block {idx}")
+                
+                try:
+                    output = execute_python_code(code)
+                    logger.info(f"Code execution completed for block {idx}")
+                    
+                    print(f"{Fore.GREEN}{'='*60}")
+                    print(f"{Fore.GREEN}CODE OUTPUT:")
+                    print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}")
+                    print_colored(output, Fore.LIGHTBLUE_EX)
+                    print()
+                    
+                    task = f"Code execution output:\n{output}"
+                    
+                except Exception as e:
+                    logger.error(f"Code execution failed: {str(e)}")
+                    error_msg = f"Error executing code: {str(e)}"
+                    print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}\n")
+                    task = error_msg
+            
+            continue
+        
+        cmd = extract_command_block(response_text)
+        
+        if cmd == "DONE":
+            print(f"\n{Fore.GREEN}{'='*60}")
+            print(f"{Fore.GREEN}Task completed!")
+            print(f"{Fore.GREEN}{'='*60}{Style.RESET_ALL}\n")
+            logger.info("Task marked as DONE")
+            
+            new_task_input = rich_input(f"{Fore.GREEN}Enter new task (or Esc+Enter to exit): {Style.RESET_ALL}")
+            if not new_task_input or not new_task_input.strip():
+                logger.info("User exited")
+                break
+            task = process_user_input(new_task_input)
+            logger.info(f"New task: {task[:100]}...")
+        
+        elif cmd == "AWAIT":
+            print(f"\n{Fore.YELLOW}AI is waiting for input{Style.RESET_ALL}")
+            user_input_raw = rich_input(f"{Fore.GREEN}Enter info: {Style.RESET_ALL}")
+            task = process_user_input(user_input_raw)
+            logger.info(f"User provided: {task[:100]}...")
+        else:
+            break
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{Fore.RED}Interrupted{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"\n{Fore.RED}Fatal error: {str(e)}{Style.RESET_ALL}")
